@@ -1,9 +1,17 @@
 import typer
-from typing import List, Optional
+from typing import Optional
+from models import Entry, EntryRepository
 from db import get_connection
-from datetime import datetime
+import sys
 
-app = typer.Typer(help="Personal Database CLI - Manage your notes, ideas, and research")
+# Initialize the CLI app
+app = typer.Typer(
+    help="Personal Database CLI - Manage your notes, ideas, and research",
+    add_completion=False
+)
+
+# Initialize repository
+entry_repo = EntryRepository(get_connection)
 
 
 @app.command()
@@ -16,57 +24,25 @@ def list_entries(
 ):
     """List entries with optional filtering."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        # Build query based on filters
-        base_query = """
-        SELECT DISTINCT e.title, e.content, e.type, e.created_at, e.updated_at
-        FROM entries e
-        """
-
-        conditions = []
-        params = []
-
-        if tag:
-            base_query += """
-            LEFT JOIN entry_tags et ON e.id = et.entry_id
-            LEFT JOIN tags t ON et.tag_id = t.id
-            """
-            conditions.append("t.name = %s")
-            params.append(tag)
-
-        if entry_type:
-            conditions.append("e.type = %s")
-            params.append(entry_type)
-
-        if conditions:
-            base_query += " WHERE " + " AND ".join(conditions)
-
-        base_query += " ORDER BY e.created_at DESC LIMIT %s"
-        params.append(limit)
-
-        cur.execute(base_query, params)
-        rows = cur.fetchall()
-
-        if not rows:
+        entries = entry_repo.get_entries(tag=tag, entry_type=entry_type, limit=limit)
+        
+        if not entries:
             typer.echo("No entries found.")
-        else:
-            typer.echo(f"\nFound {len(rows)} entries:\n")
-            for row in rows:
-                title, content, etype, created, updated = row
-                preview = content[:100] + "..." if len(content) > 100 else content
-                typer.echo(f"📝 {title}")
-                typer.echo(
-                    f"   Type: {etype} | Created: {created.strftime('%Y-%m-%d %H:%M')}"
-                )
-                typer.echo(f"   Preview: {preview}")
-                typer.echo("-" * 60)
-
-        cur.close()
-        conn.close()
+            return
+        
+        typer.echo(f"\nFound {len(entries)} entries:\n")
+        for entry in entries:
+            preview = _create_preview(entry.content, 100)
+            typer.echo(f"📝 {entry.title}")
+            typer.echo(f"   Type: {entry.entry_type} | Created: {entry.created_at.strftime('%Y-%m-%d %H:%M')}")
+            if entry.tags:
+                typer.echo(f"   Tags: {', '.join(entry.tags)}")
+            typer.echo(f"   Preview: {preview}")
+            typer.echo("-" * 60)
+            
     except Exception as e:
-        typer.echo(f"Error: {e}")
+        typer.echo(f"Error: {e}", err=True)
+        sys.exit(1)
 
 
 @app.command()
@@ -83,62 +59,32 @@ def add_entry(
 ):
     """Add a new entry to the database."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        # Insert the entry
-        cur.execute(
-            """
-        INSERT INTO entries (title, content, type, created_by)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id
-        """,
-            (title, content, entry_type, created_by),
+        # Parse tags
+        tag_list = []
+        if tags:
+            tag_list = [tag.strip() for tag in tags.split(",") if tag.strip()]
+        
+        # Create entry object
+        entry = Entry(
+            title=title,
+            content=content,
+            entry_type=entry_type,
+            created_by=created_by,
+            tags=tag_list
         )
-
-        entry_id = cur.fetchone()[0]
-
-        # Handle tags if provided
-        if tags:
-            tag_list = [tag.strip() for tag in tags.split(",")]
-            for tag_name in tag_list:
-                # Insert or get tag
-                cur.execute(
-                    """
-                INSERT INTO tags (name) VALUES (%s)
-                ON CONFLICT (name) DO NOTHING
-                RETURNING id
-                """,
-                    (tag_name,),
-                )
-
-                result = cur.fetchone()
-                if result:
-                    tag_id = result[0]
-                else:
-                    # Tag already exists, get its ID
-                    cur.execute("SELECT id FROM tags WHERE name = %s", (tag_name,))
-                    tag_id = cur.fetchone()[0]
-
-                # Link entry to tag
-                cur.execute(
-                    """
-                INSERT INTO entry_tags (entry_id, tag_id) VALUES (%s, %s)
-                ON CONFLICT DO NOTHING
-                """,
-                    (entry_id, tag_id),
-                )
-
-        conn.commit()
-        cur.close()
-        conn.close()
-
+        
+        # Save to database
+        entry_id = entry_repo.create_entry(entry)
+        
         typer.echo(f"✅ Entry '{title}' added successfully!")
-        if tags:
-            typer.echo(f"   Tags: {tags}")
-
+        typer.echo(f"   ID: {entry_id}")
+        typer.echo(f"   Type: {entry_type}")
+        if tag_list:
+            typer.echo(f"   Tags: {', '.join(tag_list)}")
+            
     except Exception as e:
-        typer.echo(f"Error adding entry: {e}")
+        typer.echo(f"Error adding entry: {e}", err=True)
+        sys.exit(1)
 
 
 @app.command()
@@ -151,145 +97,109 @@ def search(
 ):
     """Search entries by title or content."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        conditions = []
-        search_term = f"%{query}%"
-
-        if in_title:
-            conditions.append("title ILIKE %s")
-        if in_content:
-            conditions.append("content ILIKE %s")
-
-        if not conditions:
+        if not in_content and not in_title:
             typer.echo("Must search in either title or content!")
-            return
-
-        where_clause = " OR ".join(conditions)
-        params = [search_term] * len(conditions)
-
-        cur.execute(
-            f"""
-        SELECT title, content, type, created_at 
-        FROM entries 
-        WHERE {where_clause}
-        ORDER BY created_at DESC
-        """,
-            params,
-        )
-
-        rows = cur.fetchall()
-
-        if not rows:
+            sys.exit(1)
+        
+        entries = entry_repo.search_entries(query, in_title, in_content)
+        
+        if not entries:
             typer.echo(f"No entries found matching '{query}'")
-        else:
-            typer.echo(f"\nFound {len(rows)} entries matching '{query}':\n")
-            for row in rows:
-                title, content, etype, created = row
-                preview = content[:150] + "..." if len(content) > 150 else content
-                typer.echo(f"🔍 {title}")
-                typer.echo(
-                    f"   Type: {etype} | Created: {created.strftime('%Y-%m-%d %H:%M')}"
-                )
-                typer.echo(f"   Preview: {preview}")
-                typer.echo("-" * 60)
-
-        cur.close()
-        conn.close()
+            return
+        
+        typer.echo(f"\nFound {len(entries)} entries matching '{query}':\n")
+        for entry in entries:
+            preview = _create_preview(entry.content, 150)
+            typer.echo(f"🔍 {entry.title}")
+            typer.echo(f"   Type: {entry.entry_type} | Created: {entry.created_at.strftime('%Y-%m-%d %H:%M')}")
+            if entry.tags:
+                typer.echo(f"   Tags: {', '.join(entry.tags)}")
+            typer.echo(f"   Preview: {preview}")
+            typer.echo("-" * 60)
+            
     except Exception as e:
-        typer.echo(f"Error searching: {e}")
+        typer.echo(f"Error searching: {e}", err=True)
+        sys.exit(1)
 
 
 @app.command()
 def list_tags():
     """List all available tags and their usage count."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        cur.execute(
-            """
-        SELECT t.name, COUNT(et.entry_id) as usage_count
-        FROM tags t
-        LEFT JOIN entry_tags et ON t.id = et.tag_id
-        GROUP BY t.id, t.name
-        ORDER BY usage_count DESC, t.name
-        """
-        )
-
-        rows = cur.fetchall()
-
-        if not rows:
+        tags = entry_repo.get_all_tags()
+        
+        if not tags:
             typer.echo("No tags found.")
-        else:
-            typer.echo(f"\nAvailable tags ({len(rows)} total):\n")
-            for tag_name, count in rows:
-                typer.echo(f"🏷️  {tag_name} ({count} entries)")
-
-        cur.close()
-        conn.close()
+            return
+        
+        typer.echo(f"\nAvailable tags ({len(tags)} total):\n")
+        for tag in tags:
+            typer.echo(f"🏷️  {tag.name} ({tag.usage_count} entries)")
+            
     except Exception as e:
-        typer.echo(f"Error listing tags: {e}")
+        typer.echo(f"Error listing tags: {e}", err=True)
+        sys.exit(1)
 
 
 @app.command()
 def show(title: str = typer.Argument(..., help="Title of the entry to show")):
     """Show full content of a specific entry."""
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-
-        # Get entry details
-        cur.execute(
-            """
-        SELECT title, content, type, created_at, updated_at, created_by
-        FROM entries 
-        WHERE title ILIKE %s
-        """,
-            (f"%{title}%",),
-        )
-
-        entry = cur.fetchone()
-
+        entry = entry_repo.get_entry_by_title(title)
+        
         if not entry:
             typer.echo(f"No entry found matching '{title}'")
-            return
-
-        title, content, etype, created, updated, author = entry
-
-        # Get tags for this entry
-        cur.execute(
-            """
-        SELECT t.name
-        FROM tags t
-        JOIN entry_tags et ON t.id = et.tag_id
-        JOIN entries e ON et.entry_id = e.id
-        WHERE e.title = %s
-        """,
-            (title,),
-        )
-
-        tags = [row[0] for row in cur.fetchall()]
-
+            sys.exit(1)
+        
         # Display entry
-        typer.echo(f"\n📄 {title}")
-        typer.echo("=" * (len(title) + 4))
-        typer.echo(f"Type: {etype}")
-        typer.echo(f"Author: {author}")
-        typer.echo(f"Created: {created.strftime('%Y-%m-%d %H:%M:%S')}")
-        typer.echo(f"Updated: {updated.strftime('%Y-%m-%d %H:%M:%S')}")
-        if tags:
-            typer.echo(f"Tags: {', '.join(tags)}")
+        typer.echo(f"\n📄 {entry.title}")
+        typer.echo("=" * (len(entry.title) + 4))
+        typer.echo(f"Type: {entry.entry_type}")
+        typer.echo(f"Author: {entry.created_by}")
+        typer.echo(f"Created: {entry.created_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        typer.echo(f"Updated: {entry.updated_at.strftime('%Y-%m-%d %H:%M:%S')}")
+        if entry.tags:
+            typer.echo(f"Tags: {', '.join(entry.tags)}")
         typer.echo("\nContent:")
         typer.echo("-" * 40)
-        typer.echo(content)
+        typer.echo(entry.content)
         typer.echo("-" * 40)
-
-        cur.close()
-        conn.close()
+        
     except Exception as e:
-        typer.echo(f"Error showing entry: {e}")
+        typer.echo(f"Error showing entry: {e}", err=True)
+        sys.exit(1)
+
+
+@app.command()
+def init_db():
+    """Initialize the database with required tables."""
+    try:
+        from db import initialize_database, test_connection
+        
+        typer.echo("Testing database connection...")
+        if not test_connection():
+            typer.echo("❌ Database connection failed. Check your .env file.", err=True)
+            sys.exit(1)
+        
+        typer.echo("✅ Database connection successful!")
+        typer.echo("Initializing database tables...")
+        
+        if initialize_database():
+            typer.echo("✅ Database initialized successfully!")
+        else:
+            typer.echo("❌ Database initialization failed.", err=True)
+            sys.exit(1)
+            
+    except Exception as e:
+        typer.echo(f"Error initializing database: {e}", err=True)
+        sys.exit(1)
+
+
+def _create_preview(content: str, max_length: int = 100) -> str:
+    """Create a preview of content with ellipsis if too long."""
+    if len(content) <= max_length:
+        return content
+    return content[:max_length].rsplit(' ', 1)[0] + "..."
 
 
 if __name__ == "__main__":
