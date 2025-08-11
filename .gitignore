@@ -1,9 +1,6 @@
 .vscode/
 .env
 __pycache__/
-*.py[cod]
-*.class
-*.so
 .Python
 build/
 develop-eggs/
